@@ -89,33 +89,87 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
                                 dense_shape=tensor.dense_shape)
     else:
         with tf.device(device_dense):
-            horovod_size = tf.cast(size(), dtype=tensor.dtype)
-            tensor_compressed, ctx = compression.compress(tensor)
-            summed_tensor_compressed = _allreduce(tensor_compressed, op=true_op)
-            summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
-            if op == Adasum:
-                if 'CPU' not in tensor.device and gpu_available('tensorflow'):
-                    if nccl_built():
-                        if not is_homogeneous:
-                            raise NotImplementedError(
-                                'Running GPU Adasum on heterogeneous cluster is not supported yet.')
-                        elif not check_num_rank_power_of_2(int(size() / local_size())):
-                            raise NotImplementedError(
-                                'Running GPU Adasum with non-power of 2 nodes is not supported yet.')
-                        horovod_local_size = tf.cast(local_size(), dtype=tensor.dtype)
-                        new_tensor = summed_tensor / horovod_local_size
+            if tf.executing_eagerly() == True:
+                tensor_name = "metrics"
+            else:
+                tensor_name = tensor.name.split(":")[0]
+                tensor_name = tensor_name.split("/")[-3] + "_" + \
+                              tensor_name.split("/")[-2] + "_" + \
+                              tensor_name.split("/")[-1]
+            with tf.name_scope(tensor_name + "/compress") as scope:
+                horovod_size = tf.cast(size(), dtype=tensor.dtype)
+                tensor = tensor / horovod_size
+                
+                if compression.__name__ == "INT8Compressor":
+                    """
+                    local_sigma = tf.math.reduce_std(tensor)
+                    local_sigma = local_sigma / horovod_size
+                    global_sigma = _allreduce(local_sigma, op=true_op)
+                    #global_sigma = 10**tf.math.floor(tf.math.log(local_sigma) / tf.math.log(10.0))
+                    #global_sigma += 1e-4
+                    tensor_compressed, ctx = compression.compress(tensor, global_sigma)
+                    
+                    #error = tensor - compression.decompress(tensor_compressed, ctx, global_sigma)
+                    """
+                    
+                    local_max = tf.math.reduce_max(tensor)
+                    local_min = tf.math.reduce_min(tensor)
+                    
+                    local_abs_max = tf.math.maximum(tf.math.abs(local_max), tf.math.abs(local_min))
+                    local_abs_max = tf.convert_to_tensor([local_abs_max])
+                    
+                    global_abs_max_arr = allgather(local_abs_max)
+
+                    global_abs_max = tf.math.reduce_max(global_abs_max_arr)
+                    
+                    global_max = global_abs_max
+                    global_min = -global_abs_max
+                    
+                    tensor_compressed, ctx = compression.compress(tensor, 1, global_max, global_min)
+                    
+                    #error = tensor - compression.decompress(tensor_compressed, ctx, global_max, global_min)
+                    
+                else:
+                    tensor_compressed, ctx = compression.compress(tensor)
+            
+                summed_tensor_compressed = _allreduce(tensor_compressed, op=true_op)
+            
+            with tf.name_scope(tensor_name + "/decompress") as scope:
+                if compression.__name__ == "INT8Compressor":
+                    """
+                    summed_tensor = compression.decompress(summed_tensor_compressed, ctx, global_sigma)
+                    #summed_tensor += error
+                    """
+                    
+                    summed_tensor = compression.decompress(summed_tensor_compressed, ctx, global_max, global_min)
+                    #summed_tensor += error
+                    
+                else:
+                    summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
+                if op == Adasum:
+                    if 'CPU' not in tensor.device and gpu_available('tensorflow'):
+                        if nccl_built():
+                            if not is_homogeneous:
+                                raise NotImplementedError(
+                                    'Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                            elif not check_num_rank_power_of_2(int(size() / local_size())):
+                                raise NotImplementedError(
+                                    'Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                            horovod_local_size = tf.cast(local_size(), dtype=tensor.dtype)
+                            new_tensor = summed_tensor / horovod_local_size
+                        else:
+                            warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors '
+                                          'are copied to CPU memory instead. To use Adasum for GPU reduction, please '
+                                          'compile Horovod with HOROVOD_GPU_ALLREDUCE=NCCL.')
+                            new_tensor = summed_tensor
                     else:
-                        warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors '
-                                      'are copied to CPU memory instead. To use Adasum for GPU reduction, please '
-                                      'compile Horovod with HOROVOD_GPU_ALLREDUCE=NCCL.')
+                        if not check_num_rank_power_of_2(size()):
+                            raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
                         new_tensor = summed_tensor
                 else:
-                    if not check_num_rank_power_of_2(size()):
-                        raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+                    #new_tensor = (summed_tensor / horovod_size) if op == Average else summed_tensor
                     new_tensor = summed_tensor
-            else:
-                new_tensor = (summed_tensor / horovod_size) if op == Average else summed_tensor
-        return new_tensor
+            return new_tensor
 
 
 @_cache
@@ -236,14 +290,14 @@ def _make_allreduce_grads_fn(name, device_dense, device_sparse,
                 grads = [tf.convert_to_tensor(grad)
                          if grad is not None and isinstance(grad, tf.IndexedSlices)
                          else grad for grad in grads]
-
+            compressions = [compression.get(grad.name) if compression.get(grad.name) is not None else compression.get("default") for grad in grads]
             return [allreduce(grad,
                               device_dense=device_dense,
                               device_sparse=device_sparse,
                               compression=compression,
                               op=op)
                     if grad is not None else grad
-                    for grad in grads]
+                    for grad, compression in zip(grads, compressions)]
 
     if _executing_eagerly():
         return _make_subgraph(allreduce_grads)
@@ -269,7 +323,7 @@ if _LegacyOptimizer is not None:
 
         def __init__(self, optimizer, name=None, use_locking=False, device_dense='',
                     device_sparse='', compression=Compression.none,
-                    sparse_as_dense=False, op=Average):
+                    sparse_as_dense=False, op=Average, log_file = "/dev/null"):
             if name is None:
                 name = "Distributed{}".format(type(optimizer).__name__)
             super(_DistributedOptimizer, self).__init__(name=name, use_locking=use_locking)
@@ -326,6 +380,7 @@ if _LegacyOptimizer is not None:
             self._device_sparse = device_sparse
             self._compression = compression
             self._backward_passes_per_step = backward_passes_per_step
+            self._log_file = log_file
 
         def _prepare(self):
             self._step_count = tf.get_variable(
@@ -410,7 +465,7 @@ if _LegacyOptimizer is not None:
 def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='',
                          device_sparse='', compression=Compression.none,
                          sparse_as_dense=False, backward_passes_per_step=1,
-                         op=Average):
+                         op=Average, log_file="/dev/null"):
     """Construct a new DistributedOptimizer, which uses another optimizer
     under the hood for computing single-process gradient values and
     applying gradient updates after the gradient values have been combined
@@ -474,7 +529,7 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
 if hasattr(tf, 'GradientTape'):
     class _DistributedGradientTape(tf.GradientTape):
         def __init__(self, tape, device_dense, device_sparse, compression, sparse_as_dense, op,
-                     persistent=False, watch_accessed_variables=True):
+                     persistent=False, watch_accessed_variables=True, log_file="/dev/null"):
             if hasattr(tape, '_watch_accessed_variables'):
                 super(self.__class__, self).__init__(persistent, watch_accessed_variables)
             else:
@@ -495,7 +550,7 @@ if hasattr(tf, 'GradientTape'):
 
     def DistributedGradientTape(gradtape, device_dense='', device_sparse='',
                                 compression=Compression.none, sparse_as_dense=False,
-                                op=Average):
+                                op=Average, log_file="/dev/null"):
         """A tape that wraps another tf.GradientTape, using an allreduce to
         combine gradient values before applying gradients to model weights.
 

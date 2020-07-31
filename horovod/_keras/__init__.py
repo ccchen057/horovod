@@ -15,12 +15,13 @@
 
 import horovod.tensorflow as hvd
 import tensorflow as tf
+import sys, json
 
 
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
-                                 compression, sparse_as_dense):
+                                 compression, sparse_as_dense, log_file):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
-        _HAS_ALL_REDUCE_SUM_GRAD = True
+        _HAS_AGGREGATE_GRAD = True
 
         def __init__(self, **kwargs):
             self._name = name or "Distributed%s" % self.__class__.__base__.__name__
@@ -29,6 +30,7 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             self._compression = compression
             self._sparse_as_dense = sparse_as_dense
             self._aggregated_gradients = False
+            self.log_file = log_file
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -49,11 +51,20 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
 
         def _allreduce(self, gradients):
             self._aggregated_gradients = True
+            if hvd.rank() == 0:
+                __console__ = sys.stdout
+                f_handler = open(log_file, 'w+')
+                sys.stdout = f_handler
+            compression_check = {}
             if hvd.size() > 1:
                 averaged_gradients = []
                 with tf.name_scope(self._name + "_Allreduce"):
                     for grad in gradients:
                         if grad is not None:
+                            self._compression = (compression.get(grad.name) if compression.get(grad.name) is not None else compression.get("default"))
+                            compression_check.update({grad.name: 
+                                                      {"compression": self._compression.__name__, 
+                                                       "size": grad.shape.as_list()}})
                             if self._sparse_as_dense and \
                                     isinstance(grad, tf.IndexedSlices):
                                 grad = tf.convert_to_tensor(grad)
@@ -64,9 +75,20 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                             averaged_gradients.append(avg_grad)
                         else:
                             averaged_gradients.append(None)
-                    return averaged_gradients
             else:
-                return gradients
+                for grad in gradients:
+                    if grad is not None:
+                        self.compression = (compression.get(grad.name) if compression.get(grad.name) is not None else compression.get("default"))
+                        compression_check.update({grad.name: compression.__name__})
+                averaged_gradients = gradients
+
+            if hvd.rank() == 0:
+                json_dump = json.dumps(compression_check)
+                sys.stdout.write(json_dump)
+                sys.stdout = __console__
+
+            return averaged_gradients
+
 
         def apply_gradients(self, *args, **kwargs):
             if not self._aggregated_gradients:

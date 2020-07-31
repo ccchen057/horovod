@@ -328,7 +328,7 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_GPU),
 #endif
 
 REGISTER_OP("HorovodAllreduce")
-    .Attr("T: {int32, int64, float16, float32, float64}")
+    .Attr("T: {int32, int64, float16, float32, float64, bool, int8}")
     .Attr("reduce_op: int")
     .Input("tensor: T")
     .Output("sum: T")
